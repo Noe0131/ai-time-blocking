@@ -1,0 +1,50 @@
+{
+  "files.watcherExclude": {
+    "**/routeTree.gen.ts": true,
+    "**/node_modules/**": true,
+    "**/dist/**": true,
+    "**/.tanstack/**": true,
+    "**/.wrangler/**": true
+  },
+  "search.exclude": {
+    "**/routeTree.gen.ts": true,
+    "node_modules": true,
+    "dist": true,
+    ".tanstack": true,
+    ".wrangler": true
+  },
+  "files.readonlyInclude": {
+    "**/routeTree.gen.ts": true
+  },
+  "files.exclude": {
+    ".idea": true,
+    "node_modules": true,
+    "dist": true,
+    ".tanstack": true,
+    ".wrangler": true
+  },
+  "[javascript]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "[javascriptreact]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "[typescript]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "[typescriptreact]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "[json]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "[jsonc]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "[css]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "editor.codeActionsOnSave": {
+    "source.organizeImports.biome": "explicit"
+  }
+}

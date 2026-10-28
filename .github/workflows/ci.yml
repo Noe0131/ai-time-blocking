@@ -1,0 +1,305 @@
+name: CI
+
+# Job graph:
+#   backend  ──┐
+#   frontend ──┴─ docker ── CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push the image to ghcr.io"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Label events do not cancel an in-progress validation run (e.g. Dependabot adding
+# labels). They still run the full job graph so CI cannot succeed without checks.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event.action != 'labeled' && github.event.action != 'unlabeled' }}
+
+env:
+  BUN_VERSION: "1.3.14"
+  JAVA_VERSION: "25"
+  # Keep in sync with PostgreSQLContainer in backend/src/test/.../BaseTest.kt
+  POSTGRES_IMAGE: postgres:18.4
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies (root workspace)
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Lint & format check
+        run: bun run check
+        working-directory: frontend
+
+      - name: Typecheck
+        run: bun run typecheck
+        working-directory: frontend
+
+      - name: Test
+        run: bun run test
+        working-directory: frontend
+
+      - name: Build
+        run: bun run build
+        working-directory: frontend
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 1
+          if-no-files-found: error
+
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          # MIT-licensed cache; the v6 default ("enhanced") is proprietary.
+          cache-provider: basic
+
+      # Configuration cache entries store absolute jar paths. The dependency
+      # cache is immutable after the first write, so a later job can restore
+      # those paths without the jars and fail compilation. Let Gradle rebuild
+      # the configuration cache in the workspace; the build cache still hits.
+      - name: Restore Gradle build cache
+        id: gradle-build-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: backend/.gradle/build-cache
+          key: gradle-build-cache-backend-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            gradle-build-cache-backend-${{ runner.os }}-
+
+      - name: Check, Docker runtime layout, and OpenAPI spec
+        working-directory: backend
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+        run: |
+          docker pull --quiet "$POSTGRES_IMAGE" &
+          pull_pid=$!
+          ./gradlew check prepareDockerImageContext generateOpenApiJson
+          status=$?
+          kill "$pull_pid" 2>/dev/null || true
+          wait "$pull_pid" 2>/dev/null || true
+          exit "$status"
+
+      - name: Save Gradle build cache
+        if: success() && steps.gradle-build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: backend/.gradle/build-cache
+          key: gradle-build-cache-backend-${{ runner.os }}-${{ github.sha }}
+
+      - name: Upload backend runtime layout
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-runtime
+          path: backend/build/docker-image
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload OpenAPI spec
+        uses: actions/upload-artifact@v7
+        with:
+          name: openapi
+          path: backend/generated/openapi.json
+          retention-days: 1
+          if-no-files-found: error
+
+  docker:
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      actions: write
+      pull-requests: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download backend runtime layout
+        uses: actions/download-artifact@v8
+        with:
+          name: backend-runtime
+          path: image-context
+
+      - name: Download OpenAPI spec
+        uses: actions/download-artifact@v8
+        with:
+          name: openapi
+          path: image-context
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: image-context/static
+
+      - name: Place OpenAPI spec and check image inputs
+        run: |
+          set -euo pipefail
+          test -f image-context/openapi.json || {
+            echo "::error::openapi.json missing from artifacts"
+            exit 1
+          }
+          mkdir -p backend/generated
+          mv image-context/openapi.json backend/generated/openapi.json
+          test -s backend/generated/openapi.json
+          test -f image-context/app.jar || {
+            echo "::error::app.jar missing from backend runtime artifact"
+            exit 1
+          }
+          test -d image-context/lib && test -n "$(ls -A image-context/lib)" || {
+            echo "::error::lib/ missing or empty in backend runtime artifact"
+            exit 1
+          }
+          test -f image-context/static/index.html || {
+            echo "::error::frontend dist (index.html) missing from artifacts"
+            exit 1
+          }
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies (root workspace)
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Regenerate Orval client and verify no drift
+        working-directory: frontend
+        run: bun run orval:drift
+
+      - name: Resolve image tags and whether to push
+        id: image
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'push-image') }}
+          IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+          DISPATCH_PUSH: ${{ inputs.push == true }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          sha="${GITHUB_SHA:0:7}"
+          pr=""
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            pr="$PR_NUMBER"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            pr="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REF_NAME" --state open --json number --jq '.[0].number // empty' || true)"
+          fi
+          push=false
+          if [ "$EVENT_NAME" = "push" ] && [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            push=true
+          elif [ "$EVENT_NAME" = "pull_request" ] && [ "$HAS_LABEL" = "true" ]; then
+            if [ "$IS_FORK" = "true" ]; then
+              echo "::notice title=Fork pull request::push-image is set, but a fork cannot push to ghcr.io."
+            else
+              push=true
+            fi
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$DISPATCH_PUSH" = "true" ]; then
+            push=true
+          fi
+          {
+            echo "push=$push"
+            echo "tags<<EOF"
+            echo "$image:$sha"
+            if [ "$GITHUB_REF" = "refs/heads/main" ] && [ "$EVENT_NAME" != "pull_request" ]; then
+              echo "$image:latest"
+            elif [ -n "$pr" ]; then
+              echo "$image:pr-$pr"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: steps.image.outputs.push == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=unused
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: image-context
+          file: ${{ github.workspace }}/Dockerfile
+          push: ${{ steps.image.outputs.push == 'true' }}
+          tags: ${{ steps.image.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max,ignore-error=true
+
+  ci:
+    name: CI
+    if: always()
+    needs: [frontend, backend, docker]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check job results
+        env:
+          FRONTEND: ${{ needs.frontend.result }}
+          BACKEND: ${{ needs.backend.result }}
+          DOCKER: ${{ needs.docker.result }}
+        run: |
+          echo "frontend=$FRONTEND backend=$BACKEND docker=$DOCKER"
+          for r in "$FRONTEND" "$BACKEND" "$DOCKER"; do
+            test "$r" = success
+          done

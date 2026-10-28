@@ -1,0 +1,11 @@
+.slim/deepwork/
+
+# Local secrets (see .env.example)
+.env
+
+# Root package manager (lefthook + private root package.json)
+node_modules/
+lefthook-local.yml
+
+# Local Docker image context (CI artifact layout)
+image-context/
